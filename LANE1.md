@@ -60,6 +60,72 @@ actual summarizer to get a dollar number on a real agent trajectory.
 - `Context.render()` is the single seam where the proxy can capture the
   rendered prompt before it goes on the wire.
 
+## Realistic Gate 0 — go / no-go
+
+The toy fixture proves the mechanics. The realistic fixture is what decides
+whether Lane 1's full context layer is worth building. Run:
+
+```bash
+python3 -m pytest tests/test_gate0_realistic.py -v
+```
+
+The fixture (`tests/fixtures/realistic_prompts.py`) builds a deterministic
+long-agent prompt: large system prompt, 10–25 tools, a volatile memory block,
+an `active_tools` constraint, and 30–90 mixed user / assistant-reasoning /
+tool-result tail blocks. Provider-shaped pricing comes from
+`keepwarm.cost_models` (`AnthropicLikeCostModel`, `OpenAILikeCostModel`).
+
+### Metrics reported per strategy
+
+- `prompt_tokens` — total token count after the strategy runs.
+- `first_changed_index` — index of the first block whose hash differs from
+  the original. Everything before it is a cache hit on the next call.
+- `prefix_preserved_tokens` — tokens cached on the next call (sum of
+  block tokens before `first_changed_index`).
+- `destroyed_cache_tokens` — previously-cached tokens after the modification
+  point that lose cache because the prefix changed.
+- `next_call_prefill_cost` — dollar cost of the very next prefill, given the
+  cost model's cached/uncached split.
+- `recurring_saved_tokens` / `recurring_saved_cost` — tokens (and dollars) the
+  compaction stops sending on every future call.
+
+### Sample run (large fixture, Anthropic-shaped, batch_size=8)
+
+|              | fired | tokens | first_div | prefix kept | destroyed | next-call cost | recur saved |
+| ---          | ---   | ---    | ---       | ---         | ---       | ---            | ---         |
+| baseline     | —     | 15,993 | 94        | 15,993      | 0         | $0.004798      | 0           |
+| naive        | ✓     | 15,121 | **4**     | 3,670       | 11,439    | **$0.035454**  | 872         |
+| cost_aware   | ✓     | 15,234 | **86**    | 15,222      | 0         | **$0.004603**  | 759         |
+
+Naive shrinks the prompt by 872 tokens but pays for it by destroying 11,439
+tokens of cache on the *next* call — net 7× more expensive than doing nothing.
+Cost-aware compacts almost exactly as many tokens *and* keeps the prefix
+intact, so the next call is *cheaper than baseline*.
+
+### Go criteria (all must hold)
+
+- Cost-aware preserves materially more prefix than naive
+  (`first_changed_index` strictly larger).
+- Cost-aware's estimated next-call prefill cost is lower than naive's.
+- Cost-aware's recurring savings exceed its destroyed-cache cost under at
+  least one realistic provider-shaped model.
+- Behaviour is deterministic and covered by tests.
+
+Today's state: ✅ on all four under both `AnthropicLikeCostModel` and
+`OpenAILikeCostModel` (see `tests/test_gate0_realistic.py`).
+
+### No-go signals (track these as we go)
+
+- The realistic fixture flips: cost-aware ≤ naive on either prefix preservation
+  or next-call cost.
+- Recurring savings shrink to near-zero once the summarizer's overhead is real
+  rather than a constant token-count stub.
+- A provider's cache semantics (e.g. extremely small block size, no
+  breakpoints) eliminate the headroom the compactor is trading on.
+
+If any of those happen we should kill or radically rescope the compactor
+before investing in the full context layer.
+
 ## Open holes (deliberate)
 
 - Real per-provider breakpoint placement (Anthropic 4 / ~20-block lookback,
